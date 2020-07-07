@@ -3,7 +3,9 @@
 (require racket/async-channel
          racket/splicing
          struct-plus-plus
-         "private/task.rkt")
+         "messages.rkt"
+         "private/task.rkt"
+         )
 
 ;;----------------------------------------------------------------------
 
@@ -15,17 +17,21 @@
          majordomo?
          majordomo-id       majordomo.id
 
-         ; Provide only the public-facing task-related functions.  That means not the
-         ; channel for talking to the manager thread, or the custodian, or either of the
-         ; constructors, or any of the setters except for status and data.
-         task?
+         ; Parameters
+         task-timeout ; (or/c #f (and/c real? (not/c negative?)) (-> any))
+         max-restarts ; natural-number/c
+
+         ; Provide only the public-facing accessors and functions
          task-proc        task.proc
          task-id          task.id
          task-status      task.status
          task-data        task.data
-         task-manager-ch  task.manager-ch
+         task-num-restarts task.num-restarts
+         tell-manager
          set-task-status
-         set-task-data)
+         set-task-data
+
+         (all-from-out "messages.rkt"))
 
 ;;----------------------------------------------------------------------
 
@@ -33,6 +39,7 @@
           ([(id    (gensym "majordomo-"))  symbol?]  ; makes it human-identifiable
            [(cust  (make-custodian))       custodian?]))
 
+;;
 ;;----------------------------------------------------------------------
 
 (define (start-majordomo)
@@ -47,7 +54,7 @@
 ;;----------------------------------------------------------------------
 
 (define/contract (start-task jarvis proc [initial-state (hash)])
-  (->* (majordomo? task-proc/c) (any/c) task?)
+  (->* (majordomo? task-proc/c) (any/c) (values task? async-channel?))
 
   (define majordomo-cust (majordomo.cust jarvis))
 
@@ -61,7 +68,55 @@
                                    #:manager-cust manager-cust))
       (define worker-thd   (make-worker-thread  the-task))
       (define manager-thd  (make-manager-thread (set-task-worker-thd the-task worker-thd)))
-      the-task)))
+
+      ; No one outside this module has the accesor for customer-ch so we must return it
+      ; separately.  The intent is to prevent tasks from messaging their customers
+      ; directly, since that would make it more likely for them to not finalize properly.
+      (values the-task (task.customer-ch the-task)))))
+
+;;----------------------------------------------------------------------
+
+(define/contract (tell-manager the-task msg)
+  (-> task? any/c any)
+  (async-channel-put (task.manager-ch the-task) msg))
+
+;;----------------------------------------------------------------------
+
+(define/contract (tell-customer the-task msg)
+  (-> task? any/c any)
+  (async-channel-put (task.customer-ch the-task) msg))
+
+;;----------------------------------------------------------------------
+
+(define/contract (keepalive the-task)
+  (-> task? any)
+  (tell-manager the-task 'keepalive))
+
+;;----------------------------------------------------------------------
+
+(define (restart-task the-task exn-ctor)
+  (custodian-shutdown-all (task.worker-cust the-task))
+
+  (define num-restarts  (task.num-restarts the-task))
+  (define updated-task (set-task-worker-cust the-task (make-custodian)))
+  (define worker-thd   (make-worker-thread updated-task))
+  (define restarted (set-task-num-restarts
+                     (set-task-worker-thd updated-task worker-thd)
+                     (add1 num-restarts)))
+  (tell-customer restarted (exn-ctor restarted))
+  restarted)
+
+;;----------------------------------------------------------------------
+
+(define (get-latest-message manager-ch)
+  ; drain all remaining messages from the channel, get the last one (should be most
+  ; current)
+  (define remaining-msgs
+    (for/list ([msg (in-producer (lambda () (async-channel-try-get manager-ch)) #f)])
+      msg))
+  (if (null? remaining-msgs)
+      #f
+      (first (reverse remaining-msgs))))
 
 ;;----------------------------------------------------------------------
 
@@ -83,35 +138,46 @@
     ; manager-ch  allows the task to send messages to this thread
     ; customer-ch allows this thread to send messages to the thread that submitted the job
 
-    (let loop ([current    the-task])
+    (let loop ([current      the-task])
       (define current-data (task.data current))
       (define worker-thd   (task.worker-thd current))
       (match (sync/timeout (task-timeout) manager-ch worker-thd)
+        ; Is this a keepalive?
+        ['keepalive (loop current)]
+        ;
         ; Is the task complete?
-        [(and (struct* task ([status (or 'succeeded 'failed)])) msg)
-         (async-channel-put customer-ch msg)
+        [(? task? msg)
+         (tell-customer the-task msg)
          (custodian-shutdown-all (task.worker-cust current))]
         ;
         ; Is it a data update?
-        [(and (not #f) (not (== worker-thd)) (not (? task?)) updated-data)
+        [(and (not #f) (not (== worker-thd)) updated-data)
          (loop (set-task-data current updated-data))]
         ;
-        ; Did the task time out?. If so, shut down resources from prior run and restart
+        ; Did the task time out with restarts left to go?
+        ; If so, shut down resources from prior run and restart
         [#f
-         (custodian-shutdown-all (task.worker-cust current))
-         
-         (define updated-task (set-task-worker-cust current (make-custodian)))
-         (define worker-thd   (make-worker-thread updated-task))
-         (loop (set-task-worker-thd updated-task worker-thd))]
+         #:when (<= (task.num-restarts current) (max-restarts))
+         (loop (restart-task current make-task-msg:restart:timeout))]
         ;
-        ; Did the user incorrectly send us an incomplete task?
-        [(? task? msg)
-         (raise-arguments-error 'majordomo-processor
-                                "A task-processing function messaged its manager with an incomplete task.  Only legal values are a succeeded/failed task (will be returned to customer), #f (restarts the task), or a data update (anything else that is not an incomplete task or #f)"
-                                "task id"          (task.id current)
-                                "task data"        (task.data current)
-                                "invalid message"  msg)]
+        ; Did the task time out when there were no restarts left?  If so, report failure
+        [#f
+         (tell-customer the-task (set-task-status current 'failed))
+         (custodian-shutdown-all (task.worker-cust current))]
         ;
+        ;  Did the worker thread end (either due to error or completion) and we have
+        ;  restarts left?
+        [(== worker-thd)
+         #:when (<= (task.num-restarts current) (max-restarts))
+         (define latest-msg (get-latest-message manager-ch))
+         (match latest-msg
+           [(? task? msg) (tell-customer the-task msg)]
+           [(and (not #f) data)
+            (loop (restart-task (set-task-data current data)
+                                make-task-msg:restart:worker-thread))]
+           [#f (loop (restart-task current make-task-msg:restart:worker-thread))])]
+        ;
+        ; Did the worker thread end when there were NOT restarts left?
         [(== worker-thd)
          ;    Usually when we match the worker thread it means that the thread errored out
          ;    or simply ended.  On the other hand, when syncing on two events it's
@@ -121,22 +187,9 @@
          ;    instead of the message.  Check the channel one last time and wrap up based
          ;    on the results.
          (custodian-shutdown-all (task.worker-cust current))
-         ; drain all remaining messages from the channel, get the last one (should be most
-         ; current)
-         (define remaining-msgs
-           (for/list ([msg (in-producer (lambda () (async-channel-try-get manager-ch)) #f)])
-             msg))
-         (define final-msg
-           (if (null? remaining-msgs)
-               #f
-               (first (reverse remaining-msgs))))
-
-         (define failed-task (set-task-status current 'failed ))
-         (async-channel-put customer-ch
-                            (match final-msg
-                              [#f                  failed-task]
-                              [(and (struct* task ([status (or 'succeeded 'failed)])) msg)
-                               msg]
-                              [(? task? msg)       (set-task-status msg 'failed)]
-                              [(and (not #f) data) (set-task-data failed-task data)]))])))))
-
+         (define latest-msg (get-latest-message manager-ch))
+         (define failed-task (set-task-status current 'failed))
+         (tell-customer current (match latest-msg
+                                  [(? task? msg)       msg]
+                                  [(or #f 'keepalive)  failed-task]
+                                  [data (set-task-data failed-task data)]))])))))
