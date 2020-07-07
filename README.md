@@ -42,7 +42,7 @@ The return value of `proc` is ignored.
 
 # Data updates
 
-The worker thread can (but does not have to) send data-update messages to the manager. The manager will keep track of this new state and will make it available to each restart.  Also, the task that is returned on success/failure will have the latest version of the state inside it.
+The worker thread can (but does not have to) send data-update messages to the manager. The manager will keep track of this new state and will make it available to each restart. 
 
 # Example
 
@@ -58,12 +58,12 @@ The worker thread can (but does not have to) send data-update messages to the ma
                       (for/fold ([data data])
                                 ([i (in-range 10)])
                          ; tell the manager that we are working on chunk i
-                         (async-channel-put to-manager (hash-meld data (hash i 'wip)))
+                         (tell-manager the-task (hash-meld data (hash i 'wip)))
                          (sleep (random))   ; simulates the download
                          
                          ; tell the manager that we got it
                          (define next (hash-meld data (hash i #t)))
-                         (async-channel-put to-manager next)
+                         (tell-manager the-task next)
                          next))
   		   (keepalive the-task)  ; reset the timeout counter
   
@@ -72,7 +72,7 @@ The worker thread can (but does not have to) send data-update messages to the ma
   		   (keepalive the-task)  ; reset the timeout counter
   		   
                 (define result (set-task-data (set-task-status the-task 'succeeded) final-data))
-                (async-channel-put to-manager result))))
+                (tell-manager result result))))
   
     (define task-result
      (let loop ()
