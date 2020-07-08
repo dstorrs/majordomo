@@ -6,3 +6,6 @@
 (define pkg-desc "Managed job queue with stateful retry")
 (define version "0.0")
 (define pkg-authors '("David K. Storrs"))
+
+(define test-omit-paths '("test_main.rkt"))
+
