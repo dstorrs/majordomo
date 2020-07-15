@@ -19,6 +19,7 @@
 (struct++ task
           ([proc                                  (-> task? any)]
            [manager-cust                          custodian?]
+           [cleanup                               (-> task? any)]
            [(id     (gensym "task-"))             symbol?]
            [(status 'incomplete)                  (or/c 'incomplete 'succeeded 'failed)]
            [(data   (hash))                       any/c]

@@ -87,19 +87,36 @@
  (define jeeves (start-majordomo))
  (parameterize ([task-timeout 0.1])
    (define result (sync/timeout 5000
-                      (thread
-                       (thunk
-                        (define-values (the-task customer-ch)
-                          (start-task jeeves (lambda (the-task) (sync never-evt))))
+                                (thread
+                                 (thunk
+                                  (define-values (the-task customer-ch)
+                                    (start-task jeeves (lambda (the-task) (sync never-evt))))
 
-                        (is-type (async-channel-get customer-ch)
-                                 task-msg?
-                                 "The manager is notified when a timeout happens")
-                        (ok (let loop ()
-                              (match (async-channel-get customer-ch)
-                                [(struct* task ([num-restarts 6] [status 'failed])) #t]
-                                [(? task-msg?) (loop)]
-                                [else #f]))
-                            "a task that times out too many times is marked failed")))))
+                                  (is-type (async-channel-get customer-ch)
+                                           task-msg?
+                                           "The manager is notified when a timeout happens")
+                                  (ok (let loop ()
+                                        (match (async-channel-get customer-ch)
+                                          [(struct* task ([num-restarts 6] [status 'failed])) #t]
+                                          [(? task-msg?) (loop)]
+                                          [else #f]))
+                                      "a task that times out too many times is marked failed")))))
    (inc-test-num! 2) ; account for the tests that happened in the other thread
    (ok (thread? result) "timeout tests finished in a reasonable time period")))
+
+(test-suite
+ "cleanup"
+
+ (define jeeves (start-majordomo))
+ (define temp-filepath (make-temporary-file))
+ (define-values (the-task customer-ch)
+   (start-task jeeves
+               (lambda (the-task)
+                 (with-output-to-file
+                   #:exists 'replace
+                   temp-filepath
+                   (thunk (finalize the-task 'succeeded))))
+               #:cleanup (lambda (the-task)
+                           (delete-file temp-filepath))))
+ (define result (sync customer-ch))
+ (is-false (file-exists? temp-filepath) "temp file was cleaned up"))

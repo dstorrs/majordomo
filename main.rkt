@@ -31,6 +31,8 @@
          set-task-status
          set-task-data
 
+         finalize
+
          (all-from-out "messages.rkt"))
 
 ;;----------------------------------------------------------------------
@@ -53,8 +55,11 @@
 
 ;;----------------------------------------------------------------------
 
-(define/contract (start-task jarvis proc [initial-state (hash)])
-  (->* (majordomo? task-proc/c) (any/c) (values task? async-channel?))
+(define/contract (start-task jarvis proc [initial-state (hash)]
+                             #:cleanup   [cleanup (λ (the-task) 'do-nothing)])
+  (->* (majordomo? task-proc/c)
+       (any/c #:cleanup (-> task? any))
+       (values task? async-channel?))
 
   (define majordomo-cust (majordomo.cust jarvis))
 
@@ -63,9 +68,10 @@
     (define manager-cust (make-custodian)) ; created as subordinate of majordomo-cust
     (parameterize ([current-custodian manager-cust])
       ; task++ creates a custodian.  It will be a subordinate of manager-cust
-      (define the-task     (task++ #:proc proc
-                                   #:data initial-state
-                                   #:manager-cust manager-cust))
+      (define the-task     (task++ #:proc         proc
+                                   #:data         initial-state
+                                   #:manager-cust manager-cust
+                                   #:cleanup      cleanup))
       (define worker-thd   (make-worker-thread  the-task))
       (define manager-thd  (make-manager-thread (set-task-worker-thd the-task worker-thd)))
 
@@ -91,6 +97,14 @@
 (define/contract (keepalive the-task)
   (-> task? any)
   (tell-manager the-task 'keepalive))
+
+;;----------------------------------------------------------------------
+
+(define/contract (finalize the-task status)
+  (-> task? (or/c 'succeeded 'failed) task?)
+  (define updated-task  (set-task-status the-task status))
+  (tell-manager the-task updated-task)
+  updated-task)
 
 ;;----------------------------------------------------------------------
 
@@ -147,8 +161,9 @@
         ;
         ; Is the task complete?
         [(? task? msg)
-         (tell-customer the-task msg)
-         (custodian-shutdown-all (task.worker-cust current))]
+         ((task.cleanup the-task) the-task)
+         (custodian-shutdown-all (task.worker-cust current))
+         (tell-customer the-task msg)]
         ;
         ; Is it a data update?
         [(and (not #f) (not (== worker-thd)) updated-data)
